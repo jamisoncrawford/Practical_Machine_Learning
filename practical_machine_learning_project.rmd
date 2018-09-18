@@ -1,0 +1,230 @@
+---
+title: 'Practical Machine Learning: Exercise Classification'
+author: "Jamison R. Crawford, MPA"
+date: "September 17, 2018"
+output: html_document
+---
+
+# Overview
+
+The following explores **Human Activity Recognition (HAR)** data ([Velloso, et al. 2013](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har)) and provides an overview of three machine learning algorithms to predict how well subjects under study performed various exercises. Methods include: 
+
+* Classification Tree
+* Random Forest
+* Generalized Boosted Model (GBM)
+
+Classification trees were selected for interpretability, while the latter methods were selected for accuracy. Classification tree and GBM models employ k-folds cross-validation for increased accuracy, despite added computational expense. Model accuracies are compared and the final model, random forest, is used to predict 20 holdout instances for validation.
+
+### Versions
+
+This work uses both *R* and *RStudio* with the following versions:
+ 
+* **R:** 3.5.1, "Feather Spray"
+* **RStudio Desktop:** 1.1.456
+* **Analysis Date:** 2018-09-17
+
+# Preprocessing
+
+Preprocessing involves loading required *R* packages, retrieving the HAR dataset, brief exploratory data analysis (EDA), setting a seed for reproducibility, partitioning into training, test, and validation sets, and removal of features both highly correlative and at or near zero variance. Additional features are removed *a priori* with rationale provided.
+
+### Libraries & Data
+
+Required libraries have been automatically installed and loaded.
+
+```{r message=FALSE, warning=FALSE, echo=FALSE, cache=TRUE}
+if(!require(dplyr)){install.packages("dplyr")}
+if(!require(readr)){install.packages("readr")}
+if(!require(caret)){install.packages("caret")}
+if(!require(rpart)){install.packages("rpart")}
+if(!require(rattle)){install.packages("rattle")}
+if(!require(stringr)){install.packages("stringr")}
+if(!require(ggplot2)){install.packages("ggplot2")}
+if(!require(lubridate)){install.packages("lubridate")}
+if(!require(randomForest)){install.packages("randomForest")}
+
+library(dplyr)
+library(readr)
+library(caret)
+library(rpart)
+library(rattle)
+library(stringr)
+library(ggplot2)
+library(lubridate)
+library(randomForest)
+```
+
+The following loads and caches the HAR datasets via their respective URLs:
+
+```{r warning=FALSE, message=FALSE, cache=TRUE}
+url_train <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+url_valid <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+total_data <- read_csv(file = url_train)
+validation <- read_csv(file = url_valid)
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, cache=TRUE}
+rm(url_train, url_valid)
+```
+
+### Exploratory Data Analysis (EDA)
+
+A `glimpse()` of the data structure reveals that the majority of the `r nrow(total_data)` variables are of class `integer` and `numeric`, with an exceptional amount of `NA` (missing) values which will prove problematic. See **Figure 1** in the *Appendix* for the full output of `glimpse()`.
+
+```{r cache=TRUE, results="hide"}
+glimpse(total_data)
+```
+
+The variable to predict, `classe`, is roughly distributed, barring outcome `A`.
+
+```{r message=FALSE, warning=FALSE, cache=TRUE, paged.print=TRUE}
+table(total_data$classe)
+```
+
+### Data Slicing
+
+A `set.seed()` at `716` is initialized for reproducibility.
+
+```{r cache=TRUE}
+set.seed(716)
+```
+
+Due to its size ($n = 20$), the second dataset will be used as holdout: `validation`. Dataset `total_data`, with `r nrow(total_data)` instances, will be partitioned into new training and testing sets, `training` and `testing`, at 75% and 25% or 14,718 and 4,904 instances, respectively.
+
+```{r cache=TRUE}
+in_train <- createDataPartition(y = total_data$classe, 
+                                p = .75, list = FALSE)
+training <- total_data[ in_train, ]
+testing  <- total_data[-in_train, ]
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, cache=TRUE}
+rm(in_train)
+```
+
+### Dimension Reduction
+
+**Near-Zero Variance (NZV):** Features with little or no variance, detected by `nearZeroVar()`, are removed. These features provide little explanatory value for predictive models, and reduce potential features from 160 variables to 124.
+
+```{r warning=FALSE, message=FALSE, cache=TRUE}
+training <- training[, -nearZeroVar(x = training)]
+```
+
+**Principle Components Analysis (PCA):** Highly-correlative features may be redundant in terms of predictive value. *Principle Components Analysis (PCA)*, another dimension reduction technique, was attempted. However, the prevalence of `NA` (missing) values make this impossible.
+
+**Omitting Missing Values:** In light of the prevalence of `NA` (missing) values, the following eliminates features in which 95% or more of instances are `NA` (missing). Omitting features with `NA` values may create information loss, but this markedly high threshold removes features in which robust imputation is impossible, while still remaining highly discriminatory.
+
+```{r warning=FALSE, message=FALSE, cache=TRUE}
+training <- training[, which(colSums(is.na(training)) / nrow(training) < .95)]
+```
+
+**Summary Omissions:** Model selection will not account for intervals of time, by design, while omission of arbitrary features, e.g. instance number and `user_name`, will prove less problematic downstream, particularly in classification trees.
+
+```{r message=FALSE, warning=FALSE, cache=TRUE, paged.print=TRUE}
+training[2, 6]
+```
+
+These features are therefore removed:
+
+```{r warning=FALSE, message=FALSE, cache=TRUE}
+training <- select(training, -(X1:num_window))
+```
+
+### Cross-Validation
+
+Both the classification tree and GBM models employ k-folds cross-validation, which partitions subsets of training data into equally-sized test sets. By default, `trainControl()` creates 10 folds. However, due to computational expense (using GBM in particular), 7 folds are partitioned. While more efficient, this introduces more bias and variance in trade.
+
+```{r warning=FALSE, message=FALSE, cache=TRUE}
+cv_folds <- trainControl(method = "cv", number = 7)
+```
+
+# Modeling
+
+This section focuses on model building for classification trees, random forest, and GBM methods, prediction, and accuracy via confusion matrices.
+
+### Classification Tree
+
+The following fits a classification tree model using k-folds cross-validation ($k=7$), omitting instances with `NA` (missing) values. A performance overview and confusion matrix are provided, as well as visualizations of both the dendrogram and confusion matrix.
+
+```{r warning=FALSE, message=FALSE, cache=TRUE, fig.align="center"}
+dt_fit <- train(form = classe ~ ., data = training, method = "rpart", 
+                na.action = "na.omit", trControl = cv_folds)
+fancyRpartPlot(dt_fit$finalModel, sub = NULL)
+```
+
+```{r warning=FALSE, message=FALSE, cache=TRUE, fig.align="center"}
+dt_pred <- predict(object = dt_fit, newdata = testing)
+dt_conmat <- confusionMatrix(as.factor(testing$classe), dt_pred)
+plot(dt_conmat$table, main = "Classification Tree Confusion Matrix", color = "skyblue")
+dt_conmat$overall[1:4]
+```
+
+**Conclusions:** While preserving feature `X1` (row number) ensures accuracy greater than 90%, it was omitted due to being contrived and unrealistic for out-of-sample prediction. This model exhibits poor predictive performance, with test set accuracy at ~55%. It does have advantage in ease of interpretability, but ultimately proves a poor choice.
+
+### Random Forest
+
+The followng fits a random forest model sans k-folds cross-validition, foregone due to computational expense. Instances with `NA` (missing) values are omitted. A performance overview is provided and confusion matrix visualized.
+
+```{r warning=FALSE, message=FALSE, cache=TRUE, fig.align="center"}
+rf_fit <- randomForest(as.factor(classe) ~ ., data = training, na.action = "na.omit")
+rf_pred <- predict(object = rf_fit, newdata = testing)
+rf_conmat <- confusionMatrix(as.factor(testing$classe), rf_pred)
+plot(rf_conmat$table, main = "Random Forest Confusion Matrix", color = "lightgreen")
+rf_conmat$overall[1:4]
+```
+
+**Conclusions:** Random forest was selected due to its competitive reputation for accuracy. At the expense of interpretability, the accuracy of the random forest model, 99.6%, is vastly superior to the classification tree, at ~55%. A comparison with the ensuing GBM model accuracy will decide the final model.
+
+### Generalized Boosted Model (GBM)
+
+The following fits and caches a generalized boosted model (GBM) with k-folds cross-validation ($k=7$). Instances with `NA` (missing) values are omitted. A performance overview is provided, as well as two visualizations: (1) A confusion matrix, and (2) 
+
+```{r echo=TRUE, warning=FALSE, message=FALSE, cache=TRUE, results="hide"}
+gbm_fit <- train(form = as.factor(classe) ~ ., data = training, method = "gbm", na.action = "na.omit", trControl = cv_folds)
+gbm_pred <- predict(object = gbm_fit, newdata = testing)
+gbm_conmat <- confusionMatrix(as.factor(testing$classe), gbm_pred)
+```
+
+```{r warning=FALSE, message=FALSE, cache=TRUE, fig.align="center"}
+plot(gbm_conmat$table, main = "GBM Confusion Matrix", color = "tomato")
+gbm_conmat$overall[1:4]
+```
+
+**Conclusions:** Like the above random forest model, a GBM was selected *a priori* due to its competitive reputation for accuracy but also comes at the expense of interpretability. Accuracy is nearly as high as random forest, but only slightly less.
+
+# Model Review, Final Selection & Validation
+
+The following provides an overview of model performance for the classification tree, random forest, and GBM methods. It selects the most accurate model, random forest, and applies it to the holdout data: `validation` ($n=20$).
+
+### Performance Comparisons & Expected Error
+
+Both random forest and GBM perform extraordinarily well, at 99.6% and 95.9%, respectively, while the classification tree is left wanting at 55%. Therefore, the final model will be random forest: `rf_fit`. Given 99.6% accuracy, we can expect out-of-sample error to be negligible, with at least 19 of 20 correct predictions.
+
+```{r cache=TRUE, warning=FALSE, message=FALSE, echo=FALSE}
+data.frame("Classification Tree" = dt_conmat$overall[1:4],
+           "Random Forest" = rf_conmat$overall[1:4],
+           "Boosting" = gbm_conmat$overall[1:4],
+           check.names = FALSE)
+```
+
+### Validation
+
+```{r cache=TRUE}
+predict(object = rf_fit, newdata = validation)
+```
+
+The final validation test awaits, though we can reasonably assume out-of-sample error is, in all probability, negligible to nonexistent.
+
+# Appendix & Sources
+
+### Figure 1: Glimpse Output
+
+Function `glimpse()` provides the dimensions, classes, and initial instances in `total_data`.
+
+```{r cache=TRUE}
+glimpse(total_data)
+```
+
+### Works Cited
+
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. [Qualitative Activity Recognition of Weight Lifting Exercises](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201). Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
